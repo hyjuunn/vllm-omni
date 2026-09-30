@@ -1,13 +1,16 @@
 # SPDX-License-Identifier: Apache-2.0
 # SPDX-FileCopyrightText: Copyright contributors to the vLLM project
 
+import os
 from contextlib import nullcontext
+from types import MethodType
 from typing import Any
 
 import torch
 from diffusers.models.autoencoders import AutoencoderKLWan
-from diffusers.models.autoencoders.autoencoder_kl_wan import unpatchify
+from diffusers.models.autoencoders.autoencoder_kl_wan import WanAttentionBlock, unpatchify
 from diffusers.models.autoencoders.vae import DecoderOutput
+from torch.nn.attention import SDPBackend, sdpa_kernel
 from vllm.logger import init_logger
 
 from vllm_omni.diffusion.distributed.autoencoders.distributed_vae_executor import (
@@ -21,7 +24,37 @@ from vllm_omni.platforms import current_omni_platform
 logger = init_logger(__name__)
 
 
+def _wan_attention_forward_math_sdpa(
+    self: WanAttentionBlock, *args: Any, **kwargs: Any
+) -> torch.Tensor:
+    """Run a Wan VAE attention block through the safe PyTorch SDPA path."""
+    with sdpa_kernel(SDPBackend.MATH):
+        original_forward = getattr(self, "_vllm_omni_original_forward")
+        return original_forward(*args, **kwargs)
+
+
+def _enable_wan_vae_math_sdpa(module: torch.nn.Module) -> int:
+    """Wrap each Wan VAE attention block once and return the patched count."""
+    count = 0
+    for child in module.modules():
+        if not isinstance(child, WanAttentionBlock):
+            continue
+        if hasattr(child, "_vllm_omni_original_forward"):
+            continue
+        setattr(child, "_vllm_omni_original_forward", child.forward)
+        setattr(child, "forward", MethodType(_wan_attention_forward_math_sdpa, child))
+        count += 1
+    return count
+
+
 class OmniAutoencoderKLWan(AutoencoderKLWan):
+    def __init__(self, *args: Any, **kwargs: Any) -> None:
+        super().__init__(*args, **kwargs)
+        # PyTorch 2.11 predates the gfx11 dispatch fix in pytorch/pytorch@fba88a5.
+        if os.getenv("VLLM_OMNI_WAN_VAE_ATTN_MATH") == "1":
+            count = _enable_wan_vae_math_sdpa(self)
+            logger.warning("Using math SDPA for %d Wan VAE attention blocks", count)
+
     def _execution_context(self):
         try:
             first_param = next(self.parameters())

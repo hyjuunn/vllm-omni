@@ -1,3 +1,5 @@
+from contextlib import nullcontext
+
 import pytest
 import torch
 
@@ -41,3 +43,19 @@ def test_wan_vae_execution_context_uses_platform_autocast(mocker):
         dtype=torch.bfloat16,
         enabled=True,
     )
+
+
+class _DummyWanAttentionBlock(torch.nn.Module):
+    def forward(self, hidden_states: torch.Tensor) -> torch.Tensor:
+        return hidden_states + 1
+
+
+def test_enable_wan_vae_math_sdpa_wraps_attention_once(mocker):
+    model = torch.nn.Sequential(_DummyWanAttentionBlock(), torch.nn.Identity())
+    mocker.patch.object(wan_vae_module, "WanAttentionBlock", _DummyWanAttentionBlock)
+    math_context = mocker.patch.object(wan_vae_module, "sdpa_kernel", return_value=nullcontext())
+
+    assert wan_vae_module._enable_wan_vae_math_sdpa(model) == 1
+    assert wan_vae_module._enable_wan_vae_math_sdpa(model) == 0
+    assert torch.equal(model(torch.tensor([1.0])), torch.tensor([2.0]))
+    math_context.assert_called_once_with(torch.nn.attention.SDPBackend.MATH)
