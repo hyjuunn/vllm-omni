@@ -33,6 +33,7 @@ from vllm_omni.diffusion.distributed.sp_plan import (
     SequenceParallelOutput,
 )
 from vllm_omni.diffusion.forward_context import get_forward_context, is_forward_context_available
+from vllm_omni.diffusion.layers.rms_norm_rope_interleaved import can_fuse_rms_norm_rope, fused_rms_norm_rope
 from vllm_omni.diffusion.models.qwen_image_21.decode_graph import QwenImage21DecodeGraphManager
 
 if TYPE_CHECKING:
@@ -137,6 +138,24 @@ def _select_modulation_rows(params: torch.Tensor, target_token_mask: torch.Tenso
         return params.unsqueeze(1)
     real, zero = params[:-1].unsqueeze(1), params[-1:].unsqueeze(0)
     return torch.where(target_token_mask.view(1, -1, 1), real, zero)
+
+
+def _prepare_block_modulation(
+    modulation: torch.Tensor, target_token_mask: torch.Tensor | None
+) -> tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor]:
+    """Prepare the shared scales and activated gates once per transformer call.
+
+    Selection and BF16 rounding follow the block's original operation order.
+    The result belongs to this forward only; it is never cached across steps,
+    CFG branches, requests, or different local sequence-parallel layouts.
+    """
+    scale1, gate1, scale2, gate2 = modulation.chunk(4, dim=-1)
+    return (
+        1 + _select_modulation_rows(scale1, target_token_mask),
+        _select_modulation_rows(gate1, target_token_mask).tanh(),
+        1 + _select_modulation_rows(scale2, target_token_mask),
+        _select_modulation_rows(gate2, target_token_mask).tanh(),
+    )
 
 
 class QwenImage21TemporalTimesteps(nn.Module):
@@ -519,11 +538,17 @@ class QwenImage21Attention(nn.Module):
         key = key.unflatten(-1, (self.num_kv_heads, self.head_dim))
         value = value.unflatten(-1, (self.num_kv_heads, self.head_dim))
 
-        query = self.norm_q(query).to(value.dtype)
-        key = self.norm_k(key).to(value.dtype)
+        if can_fuse_rms_norm_rope(query, self.norm_q.weight, freqs) and can_fuse_rms_norm_rope(
+            key, self.norm_k.weight, freqs
+        ):
+            query = fused_rms_norm_rope(query, self.norm_q.weight, freqs, self.norm_q.eps)
+            key = fused_rms_norm_rope(key, self.norm_k.weight, freqs, self.norm_k.eps)
+        else:
+            query = self.norm_q(query).to(value.dtype)
+            key = self.norm_k(key).to(value.dtype)
 
-        query = self._apply_rotary_emb(query, freqs)
-        key = self._apply_rotary_emb(key, freqs)
+            query = self._apply_rotary_emb(query, freqs)
+            key = self._apply_rotary_emb(key, freqs)
 
         cached_key = cached_value = None
         if kv_cache is not None:
@@ -629,17 +654,6 @@ class QwenImage21TransformerBlock(nn.Module):
             prefix=f"{prefix}.img_mlp",
         )
 
-    def _modulate(
-        self,
-        hidden_states: torch.Tensor,
-        mod_params: torch.Tensor,
-        target_token_mask: torch.Tensor | None,
-    ) -> tuple[torch.Tensor, torch.Tensor]:
-        scale, gate = mod_params.chunk(2, dim=-1)
-        scale = _select_modulation_rows(scale, target_token_mask)
-        gate = _select_modulation_rows(gate, target_token_mask)
-        return hidden_states * (1 + scale), gate
-
     def forward(
         self,
         hidden_states: torch.Tensor,
@@ -652,10 +666,13 @@ class QwenImage21TransformerBlock(nn.Module):
         kv_cache: dict[str, dict[str, torch.Tensor]] | None = None,
         cache_branch: str = "cond",
         cache_write_len: int | None = None,
+        prepared_modulation: tuple[torch.Tensor, torch.Tensor, torch.Tensor, torch.Tensor] | None = None,
     ) -> torch.Tensor:
-        mod1, mod2 = modulation.chunk(2, dim=-1)
+        if prepared_modulation is None:
+            prepared_modulation = _prepare_block_modulation(modulation, target_token_mask)
+        scale1, img_gate1, scale2, img_gate2 = prepared_modulation
 
-        img_modulated, img_gate1 = self._modulate(self.img_norm1(hidden_states), mod1, target_token_mask)
+        img_modulated = self.img_norm1(hidden_states) * scale1
         attn_output = self.attn(
             img_modulated,
             freqs,
@@ -666,10 +683,10 @@ class QwenImage21TransformerBlock(nn.Module):
             cache_branch=cache_branch,
             cache_write_len=cache_write_len,
         )
-        hidden_states = hidden_states + img_gate1.tanh() * attn_output
+        hidden_states = hidden_states + img_gate1 * attn_output
 
-        img_modulated2, img_gate2 = self._modulate(self.img_norm2(hidden_states), mod2, target_token_mask)
-        hidden_states = hidden_states + img_gate2.tanh() * self.img_mlp(img_modulated2)
+        img_modulated2 = self.img_norm2(hidden_states) * scale2
+        hidden_states = hidden_states + img_gate2 * self.img_mlp(img_modulated2)
 
         if hidden_states.dtype == torch.float16:
             hidden_states = hidden_states.clip(-65504, 65504)
@@ -909,8 +926,7 @@ class QwenImage21Transformer2DModel(CachedTransformer):
                 self,
                 max_entries=cuda_graph_max_decode_graphs,
                 model_level_offload=(
-                    od_config.enable_cpu_offload
-                    or getattr(od_config, "enable_distributed_layerwise_offload", False)
+                    od_config.enable_cpu_offload or getattr(od_config, "enable_distributed_layerwise_offload", False)
                 ),
             )
             if self.enable_cuda_graph_decode
@@ -1182,11 +1198,13 @@ class QwenImage21Transformer2DModel(CachedTransformer):
             elif joint_key_valid is not None:
                 attn_metadata = AttentionMetadata(attn_mask=joint_key_valid)
 
+        prepared_modulation = _prepare_block_modulation(modulation, local_mask)
         for index_block, block in enumerate(self.transformer_blocks):
             block_kv_cache = kv_cache[index_block] if kv_cache is not None else None
             joint_hidden_states = block(
                 hidden_states=joint_hidden_states,
                 modulation=modulation,
+                prepared_modulation=prepared_modulation,
                 freqs=freqs,
                 target_token_mask=local_mask,
                 attn_metadata=attn_metadata,
@@ -1241,10 +1259,12 @@ class QwenImage21Transformer2DModel(CachedTransformer):
         timestep = torch.cat([entry.timestep, entry.timestep.new_zeros(1)], dim=0)
         temb = self.time_text_embed(timestep, hidden_states)
         modulation = self.modulation(temb)
+        prepared_modulation = _prepare_block_modulation(modulation, entry.target_token_mask)
         for index_block, block in enumerate(self.transformer_blocks):
             hidden_states = block(
                 hidden_states=hidden_states,
                 modulation=modulation,
+                prepared_modulation=prepared_modulation,
                 freqs=entry.freqs,
                 target_token_mask=entry.target_token_mask,
                 attn_metadata=entry.attn_metadata,
