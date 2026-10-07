@@ -1050,6 +1050,17 @@ class DiffusionWorker:
         self._step_lora_state = {}
 
         if model_runner is not None:
+            adapter = getattr(getattr(model_runner, "pipeline", None), "_wan_lowering_adapter", None)
+            try:
+                if adapter is not None:
+                    try:
+                        adapter.remove()
+                    finally:
+                        adapter.backend.close()
+            except Exception:
+                logger.exception("Failed to shut down Wan lowering adapter during shutdown")
+            finally:
+                del adapter
             mgr = getattr(model_runner, "kv_transfer_manager", None)
             if mgr is None:
                 mgr = getattr(model_runner, "_kv_transfer_manager", None)

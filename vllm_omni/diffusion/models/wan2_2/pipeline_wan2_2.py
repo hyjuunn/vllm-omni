@@ -493,6 +493,9 @@ class Wan22Pipeline(
         ).to(self.device)
 
         # Initialize transformers with correct config (weights loaded via load_weights)
+        self._wan_lowering_adapter = None
+        self._wan_lowering_activation_checked = False
+
         if load_transformer:
             transformer_config = load_transformer_config(model, "transformer", local_files_only)
             self.transformer = self._create_transformer(transformer_config, component="transformer")
@@ -681,6 +684,12 @@ class Wan22Pipeline(
         return latents
 
     def forward(self, req: DiffusionRequestBatch) -> list[DiffusionOutput]:
+        if not self._wan_lowering_activation_checked:
+            from vllm_omni.diffusion.layers.wan3d_lowering import install_if_requested
+            self._wan_lowering_adapter = install_if_requested(self.vae, self.od_config) if self.expand_timesteps and self.vae.config.z_dim == 48 else None
+            self._wan_lowering_activation_checked = True
+        if self._wan_lowering_adapter is not None:
+            self._wan_lowering_adapter.begin_request(req)
         sampling_params_list = req.sampling_params_list
         common = sampling_params_list[0]
         prompt_texts = [prompt if isinstance(prompt, str) else (prompt.get("prompt") or "") for prompt in req.prompts]
@@ -1031,6 +1040,8 @@ class Wan22Pipeline(
                     _t_pipeline_wall_ms - _t_stages_sum,
                 )
 
+        if self._wan_lowering_adapter is not None:
+            self._wan_lowering_adapter.write_report()
         return split_diffusion_output_by_request(
             DiffusionOutput(
                 output=output,
