@@ -331,6 +331,22 @@ class AdaLayerNorm(CustomOp):
         scale: torch.Tensor,
         shift: torch.Tensor,
     ) -> torch.Tensor:
+        # Keep compiled graphs and autograd on the native path. In particular,
+        # compiled Qwen must not trace the eager Triton dispatch/device query.
+        if (
+            torch.compiler.is_compiling()
+            or self.elementwise_affine
+            or self.layernorm.weight is not None
+            or self.layernorm.bias is not None
+            or self.hidden_size != 3072
+            or any(t.requires_grad for t in (x, scale, shift))
+        ):
+            return self.forward_native(x, scale, shift)
+
+        from vllm_omni.diffusion.layers.fused_adalayernorm import can_fuse_adalayernorm, fused_adalayernorm
+
+        if can_fuse_adalayernorm(x, scale, shift):
+            return fused_adalayernorm(x, scale, shift, eps=self.eps)
         return self.forward_native(x, scale, shift)
 
     def forward_musa(
